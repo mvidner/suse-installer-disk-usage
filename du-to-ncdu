@@ -1,0 +1,199 @@
+#!/usr/bin/env ruby
+
+# du-to-ncdu < foo.du | ncdu -f -
+
+require "json"
+
+# `du` output cannot distinguish a file from an empty dir
+# see also du --time, -S/--separate-dirs
+
+#
+class ParsedDu < Hash
+  # by default it includes descendant size
+  attr_accessor :size_b
+
+  # see stdlib pp.rb
+  def pretty_print(q)
+    q.pp_hash(merge(size_b: size_b))
+  end
+
+  # @param scale [Integer] multiplier to get byte size from du stated size
+  # @return [ParsedDu]
+  def self.parse_du(io, scale = 1024)
+    root = new
+
+    io.each_line do |l|
+      size_s, name = l.chomp.split
+      target = deep_create(root, name.split("/"))
+      target.size_b = size_s.to_i * scale
+    end
+    root
+  end
+
+  # @return [ParsedDu] the innermost one
+  def self.deep_create(root, components)
+    target = root
+    components.each do |component|
+      target[component] ||= new
+      target = target[component]
+    end
+    target
+  end
+end
+
+du_tree = ParsedDu.parse_du($stdin)
+#pp du_tree
+#exit
+
+def du_to_gen(pdu, name = "*root*")
+  children_sizes = pdu.values.reduce(0) { |acc, i| acc + i.size_b }
+  size_b = (pdu.size_b || 0) - children_sizes # FIXME descendant size must not be included
+
+
+  if pdu.empty?
+    Entry.new(name, size_b)
+  else
+    children = pdu.map do |child_name, child_pdu|
+      du_to_gen(child_pdu, child_name)
+    end
+    Directory.new(name, size_b, children)
+  end
+end
+
+class Entry
+  # @return [String]
+  attr_reader :name
+  attr_reader :size_b
+  def initialize(name, size_b)
+    @name = name
+    @size_b = size_b
+  end
+end
+
+class Directory < Entry
+  # @return [Array<Entry>]
+  attr_reader :children
+  def initialize(name, size_b, children)
+    super(name, size_b)
+    @children = children
+  end
+end
+
+
+test_tree = Directory.new(
+  "world", 0, [
+    Directory.new(
+      "europe", 500_000_000, [
+        Entry.new("cz", 10_000_000),
+        Entry.new("pl", 40_000_000),
+        Entry.new("de", 80_000_000),
+      ]
+    ),
+    Directory.new(
+      "america", 0, [
+        Entry.new("ca", 38_000_000),
+        Entry.new("us", 330_000_000),
+        Entry.new("uy", 3_500_000),
+      ]
+    ),
+    Directory.new(
+      "asia", 0, [
+        Entry.new("cn", 1_400_000_000),
+        Entry.new("in", 1_350_000_000),
+        Entry.new("jp", 126_000_000),        
+      ]
+    )
+  ]
+)
+
+# include this to delegate {#to_json} to {#as_json}
+module AsJson
+  def to_json(*args)
+    as_json.to_json(*args)
+  end
+end
+
+class NcduEntry
+end
+
+#
+class NcduLeaf < NcduEntry
+  def initialize(name, dsize)
+    @name = name
+    @dsize = dsize
+  end
+
+  def self.from_entry(entry)
+    new(entry.name, entry.size_b)
+  end
+
+  include AsJson
+  def as_json
+    { name: @name, dsize: @dsize }
+  end
+end
+
+# 
+class NcduTree < NcduEntry
+  # @return [NcduLeaf] (its {#size} is its own, excluding the children)
+  attr_reader :info
+  # @return [Array<NcduEntry>]
+  attr_reader :entries
+
+  def initialize(info, entries)
+    @info = info
+    @entries = entries
+  end
+
+  def self.from_dir(directory)
+    info = NcduLeaf.from_entry(directory)
+    entries = directory.children.map do |entry|
+      case entry
+      when Directory
+        NcduTree.from_dir(entry)
+      else
+        NcduLeaf.from_entry(entry)
+      end
+    end
+
+    new(info, entries)
+  end
+
+  include AsJson
+  def as_json
+    [info, *entries]
+  end
+end
+
+#
+class NcduRoot
+  attr_reader :tree
+
+  def self.from_dir(directory)
+    new(NcduTree.from_dir(directory))
+  end
+
+  def initialize(tree)
+    @tree = tree
+  end
+
+  include AsJson
+  def as_json
+    # https://dev.yorhel.nl/ncdu/jsonfmt
+    [1, 0, { progname: "du_to_ncdu" }, tree]
+  end
+end
+
+gen_tree = du_to_gen(du_tree).children.first
+ncdu_tree = NcduRoot.from_dir(gen_tree)
+puts ncdu_tree.to_json
+exit
+
+example_tree = Directory.new("/media/harddrive", 4096, [
+                               Entry.new("SomeFile", 32768),
+                               Directory.new("EmptyDir", 4096, [])
+                             ])
+ncdu_tree = NcduRoot.from_dir(test_tree)
+# ncdu_tree = NcduRoot.from_dir(example_tree)
+
+puts ncdu_tree.to_json
