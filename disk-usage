@@ -1,0 +1,104 @@
+#!/bin/bash
+
+# given a repo URL, download the interesting files
+#DISTRO=openSUSE-stable
+DISTRO=leap/15.2
+REPO=https://download.opensuse.org/distribution/$DISTRO/repo/oss/
+NOSLASH_DISTRO="${DISTRO//\//_}"
+#DISTRO=SLE-15-Installer-GM
+#DISTRO=SLE-15-SP2-Full-GM
+#REPO=http://dist.suse.de/install/SLP/$DISTRO/x86_64/DVD1/
+
+# .cpio.xz
+INITRD=boot/x86_64/loader/initrd
+# .squashfs
+IMAGES="boot/x86_64/common boot/x86_64/root boot/x86_64/rescue"
+
+# produce for viewing
+# $DISTRO-$IMAGE.du
+# $DISTRO-$IMAGE.qdirstat
+
+rmrf() {
+    chmod -R u+w "$1"           # rm -rf fails on read-only directories
+    rm -rf "$1"
+}
+
+# $1 initrd filename
+# $2 empty writable dir to use as scratch/mount space
+initrd_open() {
+    unxz < "$1" | (cd "$2" || exit; cpio --extract)
+}
+
+# $1 and $2 matching initrd_open
+initrd_close() {
+    rmrf "$2"
+}
+
+# $1 squashfs filename
+# $2 empty writable dir to use as scratch/mount space
+squashfs_open() {
+    local f
+    f="$(pwd)/$1"
+    (cd "$2" || exit; unsquashfs "$f")
+}
+
+# $1 and $2 matching squashfs_open
+squashfs_close() {
+    rmrf "$2"
+}
+
+# measure CWD
+# $1 basename for report
+measure() {
+    du --all --one-file-system > "$1.du"
+    qdirstat-cache-writer . "$1.qdirstat.cache.gz"
+}
+
+# $1 image filename
+# $2 report dir+prefix
+measure_image() {
+    local f="$1"
+    local report_base="$2"
+
+    local dir report
+    dir=$(mktemp -d) || exit
+    report="${report_base}-$(basename "$f")"
+
+    case "$f" in
+        *initrd) initrd_open "$f" "$dir" ;;
+        *)     squashfs_open "$f" "$dir" ;;
+    esac
+
+    (
+        cd "$dir" || exit
+        measure "$report"
+
+        if test -d parts; then
+            for p in parts/*; do
+                measure_image "$p" "${report_base}"
+            done
+        fi
+    )
+    
+    case "$f" in
+        *initrd) initrd_close "$f" "$dir" ;;
+        *)     squashfs_close "$f" "$dir" ;;
+    esac
+}
+
+# mirror
+# $1 REPO base URL
+# $2 path
+get_file() {
+    mkdir -p "$(dirname "$2")"
+    if [ -f "$2" ]; then
+        return
+    fi
+    wget --output-document="$2" "$1/$2"
+}
+
+for f in $INITRD $IMAGES; do
+    get_file "$REPO" "$f"
+    measure_image "$f" "$(pwd)/${NOSLASH_DISTRO}"
+    rm "$f"
+done
